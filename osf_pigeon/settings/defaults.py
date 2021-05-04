@@ -11,7 +11,9 @@ IA_ACCESS_KEY = os.environ.get("IA_ACCESS_KEY")
 IA_SECRET_KEY = os.environ.get("IA_SECRET_KEY")
 DATACITE_PREFIX = "10.17605"
 
-PIGEON_TEMP_DIR = os.environ.get('PIGEON_TEMP_DIR', None)  # setting to None allows tempfile.py to decide
+PIGEON_TEMP_DIR = os.environ.get(
+    "PIGEON_TEMP_DIR", None
+)  # setting to None allows tempfile.py to decide
 
 HOST = "0.0.0.0"
 

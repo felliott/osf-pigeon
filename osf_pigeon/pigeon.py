@@ -1,4 +1,5 @@
 import re
+import time
 import json
 import os
 from io import BytesIO
@@ -19,7 +20,8 @@ import zipfile
 import bagit
 from ratelimit import sleep_and_retry
 from ratelimit.exception import RateLimitException
-
+from aiohttp import http_exceptions, ClientSession, ClientTimeout
+from aiohttp.log import server_logger
 
 REG_ID_TEMPLATE = f"osf-registrations-{{guid}}-{settings.ID_VERSION}"
 PROVIDER_ID_TEMPLATE = (
@@ -27,11 +29,13 @@ PROVIDER_ID_TEMPLATE = (
 )
 
 
-def get_and_write_file_data_to_temp(from_url, to_dir, name):
-    with get_with_retry(from_url) as response:
+def get_raw_data(from_url, to_dir, name):
+    server_logger.info(f"downloading from to {from_url}")
+    with requests.get(from_url) as resp:
         with open(os.path.join(to_dir, name), "wb") as fp:
-            for chunk in response.iter_content():
+            for chunk in resp.content:
                 fp.write(chunk)
+    server_logger.info(f"download from {from_url} complete")
 
 
 async def get_and_write_json_to_temp(from_url, to_dir, name, parse_json=None):
@@ -207,37 +211,38 @@ async def write_datacite_metadata(guid, temp_dir, metadata):
 
 
 @sleep_and_retry
-def get_with_retry(url, retry_on=(), sleep_period=None, headers=None):
+async def get_with_retry(url, retry_on=(), sleep_period=None, headers=None):
     if not headers:
         headers = {}
 
     if settings.OSF_BEARER_TOKEN:
         headers["Authorization"] = f"Bearer {settings.OSF_BEARER_TOKEN}"
 
-    resp = requests.get(url, headers=headers, stream=True)
-    if resp.status_code in retry_on:
-        raise RateLimitException(
-            message="Too many requests, sleeping.",
-            period_remaining=sleep_period or int(resp.headers.get("Retry-After") or 0),
-        )  # This will be caught by @sleep_and_retry and retried
-    resp.raise_for_status()
-
-    return resp
+    async with ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status in retry_on:
+                raise RateLimitException(
+                    message="Too many requests, sleeping.",
+                    period_remaining=sleep_period
+                    or int(resp.headers.get("Retry-After") or 0),
+                )  # This will be caught by @sleep_and_retry and retried
+            resp.raise_for_status()
+            return await resp.json()
 
 
 async def get_pages(url, page, result={}, parse_json=None):
     url = f"{url}?page={page}&page={page}"
-    resp = get_with_retry(url, retry_on=(429,))
+    data = await get_with_retry(url, retry_on=(429,))
 
-    result[page] = resp.json()["data"]
+    result[page] = data["data"]
 
     if parse_json:
-        result[page] = parse_json(resp.json())["data"]
+        result[page] = parse_json(data)["data"]
 
     return result
 
 
-def get_contributors(response):
+async def get_contributors(response):
     contributor_data_list = []
     for contributor in response["data"]:
         contributor_data = {}
@@ -245,8 +250,9 @@ def get_contributors(response):
         institution_url = embed_data["relationships"]["institutions"]["links"][
             "related"
         ]["href"]
-        institution_response = get_with_retry(institution_url, retry_on=(429,))
-        institution_data = institution_response.json()["data"]
+        institution_data = (await get_with_retry(institution_url, retry_on=(429,)))[
+            "data"
+        ]
         institution_list = [
             institution["attributes"]["name"] for institution in institution_data
         ]
@@ -258,13 +264,12 @@ def get_contributors(response):
 
 
 async def get_paginated_data(url, parse_json=None):
-    data = get_with_retry(url, retry_on=(429,)).json()
-
+    data = await get_with_retry(url, retry_on=(429,))
     tasks = []
     is_paginated = data.get("links", {}).get("next")
 
     if parse_json:
-        data = parse_json(data)
+        data = await parse_json(data)
 
     if is_paginated:
         result = {1: data["data"]}
@@ -336,10 +341,9 @@ def sync_metadata(guid, metadata):
 
     invalid_keys = set(metadata.keys()).difference(set(valid_updatable_metadata_keys))
     if invalid_keys:
-        raise SanicException(
+        raise http_exceptions.PayloadEncodingError(
             f"Metadata payload contained invalid tag(s): `{', '.join(list(invalid_keys))}`"
             f" not included in valid keys: `{', '.join(valid_updatable_metadata_keys)}`.",
-            status_code=400,
         )
 
     # remap these with `osf_` prefix for IA
@@ -389,6 +393,7 @@ async def upload(item_name, data, metadata):
         },
         access_key=settings.IA_ACCESS_KEY,
         secret_key=settings.IA_SECRET_KEY,
+        verbose=True,
     )
     return ia_item
 
@@ -414,21 +419,10 @@ async def get_registration_metadata(guid, temp_dir, filename):
     return metadata
 
 
-async def get_raw_data(guid, temp_dir):
-    try:
-        get_and_write_file_data_to_temp(
-            from_url=f"{settings.OSF_FILES_URL}v1/resources/{guid}/providers/osfstorage/?zip=",
-            to_dir=temp_dir,
-            name="archived_files.zip",
-        )
-    except requests.exceptions.ChunkedEncodingError:
-        raise requests.exceptions.ChunkedEncodingError(
-            f"OSF file system is sending incomplete streams for {guid}"
-        )
-
-
 async def archive(guid):
-    with tempfile.TemporaryDirectory(dir=settings.PIGEON_TEMP_DIR, prefix=REG_ID_TEMPLATE.format(guid=guid)) as temp_dir:
+    with tempfile.TemporaryDirectory(
+        dir=settings.PIGEON_TEMP_DIR, prefix=REG_ID_TEMPLATE.format(guid=guid)
+    ) as temp_dir:
         # await first to check if withdrawn
         metadata = await get_registration_metadata(guid, temp_dir, "registration.json")
 
@@ -459,7 +453,11 @@ async def archive(guid):
             "meta"
         ]["count"]
         if file_count:
-            tasks.append(get_raw_data(guid, temp_dir))
+            get_raw_data(
+                from_url=f"{settings.OSF_FILES_URL}v1/resources/{guid}/providers/osfstorage/?zip=",
+                to_dir=temp_dir,
+                name="archived_files.zip"
+            )
 
         await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
 
