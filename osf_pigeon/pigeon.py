@@ -31,7 +31,7 @@ PROVIDER_ID_TEMPLATE = (
 
 def get_raw_data(from_url, to_dir, name):
     server_logger.info(f"downloading from to {from_url}")
-    with requests.get(from_url, stream=True) as resp:
+    with requests.get(from_url, stream=True, timeout=60.1) as resp:
         with open(os.path.join(to_dir, name), "wb") as fp:
             count = 0
             for chunk in resp.iter_content():
