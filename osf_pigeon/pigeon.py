@@ -31,9 +31,14 @@ PROVIDER_ID_TEMPLATE = (
 
 def get_raw_data(from_url, to_dir, name):
     server_logger.info(f"downloading from to {from_url}")
-    with requests.get(from_url) as resp:
+    with requests.get(from_url, stream=True) as resp:
         with open(os.path.join(to_dir, name), "wb") as fp:
-            for chunk in resp.content:
+            count = 0
+            for chunk in resp.iter_content(4096):
+                count += 1
+                if not(count % 1000):  # about 130 debug messages
+                    server_logger.info('&&&& time:({}) chunk:({}) isa:({}) and size '
+                                       'is:({})'.format(time.time(), count, type(chunk), len(chunk)))
                 fp.write(chunk)
     server_logger.info(f"download from {from_url} complete")
 
