@@ -34,7 +34,7 @@ def get_raw_data(from_url, to_dir, name):
     with requests.get(from_url, stream=True, timeout=60.1) as resp:
         with open(os.path.join(to_dir, name), "wb") as fp:
             count = 0
-            for chunk in resp.iter_content():
+            for chunk in resp.iter_content(1024):
                 count += 1
                 if not(count % 1000):  # about 130 debug messages
                     server_logger.info('&&&& time:({}) chunk:({}) isa:({}) and size '
